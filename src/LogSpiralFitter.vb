@@ -849,31 +849,194 @@ Public Class CatiaRunner
         File.SetAttributes(filePath, File.GetAttributes(filePath) Or FileAttributes.Hidden)
     End Sub
 
+    Private Shared Function FindHybridBodyByName(ByVal part As Object, ByVal name As String) As Object
+        Dim bodies As Object = part.HybridBodies
+        For i As Integer = 1 To CInt(bodies.Count)
+            Dim b As Object = bodies.Item(i)
+            Try
+                If String.Equals(CStr(b.Name), name, StringComparison.OrdinalIgnoreCase) Then
+                    Return b
+                End If
+            Catch
+            End Try
+        Next
+        Return Nothing
+    End Function
+
+    Private Shared Function FindShapeInBodyByName(ByVal body As Object, ByVal shapeName As String) As Object
+        If body Is Nothing Then Return Nothing
+        Dim shapes As Object = body.HybridShapes
+        For j As Integer = 1 To CInt(shapes.Count)
+            Dim s As Object = shapes.Item(j)
+            Try
+                If String.Equals(CStr(s.Name), shapeName, StringComparison.OrdinalIgnoreCase) Then
+                    Return s
+                End If
+            Catch
+            End Try
+        Next
+        Return Nothing
+    End Function
+
+    Private Shared Function ImportSourceCurveIntoTemplatePart(ByVal catia As Object, ByVal sourcePath As String, ByVal choice As CurveChoice, ByVal outputDoc As Object, ByVal outputPart As Object) As Object
+        Dim bodiesToDelete As New List(Of Object)()
+        Dim bodies As Object = outputPart.HybridBodies
+        For i As Integer = 1 To CInt(bodies.Count)
+            Dim b As Object = bodies.Item(i)
+            If Not String.Equals(CStr(b.Name), "LogSpiral_Equation", StringComparison.OrdinalIgnoreCase) Then
+                bodiesToDelete.Add(b)
+            End If
+        Next
+        If bodiesToDelete.Count > 0 Then
+            Dim delSel As Object = outputDoc.Selection
+            delSel.Clear()
+            For Each b As Object In bodiesToDelete
+                Try : delSel.Add(b) : Catch : End Try
+            Next
+            If CInt(delSel.Count) > 0 Then
+                Try : delSel.Delete() : Catch : End Try
+            End If
+            delSel.Clear()
+        End If
+        Try
+            Dim udfObj As Object = outputPart.FindObjectByName("LogSpiral_PowerCopy")
+            If udfObj IsNot Nothing Then
+                Dim udfSel As Object = outputDoc.Selection
+                udfSel.Clear()
+                udfSel.Add(udfObj)
+                udfSel.Delete()
+                udfSel.Clear()
+            End If
+        Catch
+        End Try
+
+        Dim srcBody As Object = outputPart.HybridBodies.Add()
+        Dim srcBodyName As String = If(String.IsNullOrEmpty(choice.BodyName) OrElse String.Equals(choice.BodyName, "LogSpiral_Equation", StringComparison.OrdinalIgnoreCase), "Source_Geometry", choice.BodyName)
+        srcBody.Name = srcBodyName
+
+        Dim tempSourcePath As String = Path.Combine(Path.GetTempPath(), "__LogSpiral_Src_" & Guid.NewGuid().ToString("N") & ".CATPart")
+        File.Copy(sourcePath, tempSourcePath, True)
+        Try
+            Dim attrs As FileAttributes = File.GetAttributes(tempSourcePath)
+            If (attrs And FileAttributes.ReadOnly) = FileAttributes.ReadOnly Then
+                File.SetAttributes(tempSourcePath, attrs And Not FileAttributes.ReadOnly)
+            End If
+        Catch
+        End Try
+
+        Dim prevAlerts As Boolean = True
+        Try : prevAlerts = CBool(catia.DisplayFileAlerts) : Catch : End Try
+        Try : catia.DisplayFileAlerts = False : Catch : End Try
+        Dim tempSourceDoc As Object = Nothing
+        Try
+            tempSourceDoc = catia.Documents.Open(tempSourcePath)
+            Dim srcPart As Object = tempSourceDoc.Part
+            Dim srcCurve As Object = ResolveCurveInCopiedPart(tempSourceDoc, srcPart, choice)
+            tempSourceDoc.Activate()
+            Dim srcSel As Object = tempSourceDoc.Selection
+            srcSel.Clear()
+            srcSel.Add(srcCurve)
+            srcSel.Copy()
+            srcSel.Clear()
+
+            outputDoc.Activate()
+            Dim dstSel As Object = outputDoc.Selection
+            dstSel.Clear()
+            dstSel.Add(srcBody)
+            Try
+                dstSel.PasteSpecial("CATPrtResultWithOutLink")
+            Catch
+                dstSel.Paste()
+            End Try
+            dstSel.Clear()
+        Finally
+            If tempSourceDoc IsNot Nothing Then
+                Try : tempSourceDoc.Close() : Catch : End Try
+            End If
+            Try : catia.DisplayFileAlerts = prevAlerts : Catch : End Try
+            DeleteFileQuietly(tempSourcePath)
+        End Try
+
+        Dim shapeCount As Integer = CInt(srcBody.HybridShapes.Count)
+        If shapeCount <= 0 Then
+            Throw New InvalidOperationException("未能将源曲线导入工作文档。")
+        End If
+        Dim importedCurve As Object = srcBody.HybridShapes.Item(shapeCount)
+        Try : importedCurve.Name = choice.CurveName : Catch : End Try
+        outputPart.Update()
+        Return importedCurve
+    End Function
+
     Private Shared Function BuildEquationDefinition(ByVal doc As Object, ByVal part As Object, ByVal fit As FitResult, ByRef paramMap As Dictionary(Of String, Object)) As Object()
         Dim factory As Object = part.HybridShapeFactory
-        Dim resultBody As Object = part.HybridBodies.Add()
-        resultBody.Name = "LogSpiral_Equation"
+        Dim resultBody As Object = FindHybridBodyByName(part, "LogSpiral_Equation")
+        If resultBody Is Nothing Then
+            resultBody = part.HybridBodies.Add()
+            resultBody.Name = "LogSpiral_Equation"
+        End If
 
-        Dim centerPoint As Object = factory.AddNewPointCoord(fit.Center.X, fit.Center.Y, fit.Center.Z)
-        centerPoint.Name = "Fitted_Center"
-        resultBody.AppendHybridShape(centerPoint)
+        Dim centerPoint As Object = FindShapeInBodyByName(resultBody, "Fitted_Center")
+        If centerPoint Is Nothing Then
+            centerPoint = factory.AddNewPointCoord(fit.Center.X, fit.Center.Y, fit.Center.Z)
+            centerPoint.Name = "Fitted_Center"
+            resultBody.AppendHybridShape(centerPoint)
+        Else
+            centerPoint.X.ValuateFromString(fit.Center.X.ToString("R", Inv) & "mm")
+            centerPoint.Y.ValuateFromString(fit.Center.Y.ToString("R", Inv) & "mm")
+            centerPoint.Z.ValuateFromString(fit.Center.Z.ToString("R", Inv) & "mm")
+        End If
+
         Dim axisLength As Double = Math.Max(10.0, Math.Exp(fit.Alpha) * 0.25)
         Dim uEnd3 As Point3 = VectorMath.Add(fit.Center, VectorMath.Scale(fit.AxisU, axisLength))
         Dim vEnd3 As Point3 = VectorMath.Add(fit.Center, VectorMath.Scale(fit.AxisV, axisLength))
-        Dim uEnd As Object = factory.AddNewPointCoord(uEnd3.X, uEnd3.Y, uEnd3.Z)
-        uEnd.Name = "Reference_U_End" : resultBody.AppendHybridShape(uEnd)
-        Dim vEnd As Object = factory.AddNewPointCoord(vEnd3.X, vEnd3.Y, vEnd3.Z)
-        vEnd.Name = "Reference_V_End" : resultBody.AppendHybridShape(vEnd)
+        Dim uEnd As Object = FindShapeInBodyByName(resultBody, "Reference_U_End")
+        If uEnd Is Nothing Then
+            uEnd = factory.AddNewPointCoord(uEnd3.X, uEnd3.Y, uEnd3.Z)
+            uEnd.Name = "Reference_U_End" : resultBody.AppendHybridShape(uEnd)
+        Else
+            uEnd.X.ValuateFromString(uEnd3.X.ToString("R", Inv) & "mm")
+            uEnd.Y.ValuateFromString(uEnd3.Y.ToString("R", Inv) & "mm")
+            uEnd.Z.ValuateFromString(uEnd3.Z.ToString("R", Inv) & "mm")
+        End If
+
+        Dim vEnd As Object = FindShapeInBodyByName(resultBody, "Reference_V_End")
+        If vEnd Is Nothing Then
+            vEnd = factory.AddNewPointCoord(vEnd3.X, vEnd3.Y, vEnd3.Z)
+            vEnd.Name = "Reference_V_End" : resultBody.AppendHybridShape(vEnd)
+        Else
+            vEnd.X.ValuateFromString(vEnd3.X.ToString("R", Inv) & "mm")
+            vEnd.Y.ValuateFromString(vEnd3.Y.ToString("R", Inv) & "mm")
+            vEnd.Z.ValuateFromString(vEnd3.Z.ToString("R", Inv) & "mm")
+        End If
         part.Update()
-        Dim axisULine As Object = factory.AddNewLinePtPt(part.CreateReferenceFromObject(centerPoint), part.CreateReferenceFromObject(uEnd))
-        axisULine.Name = "Reference_Axis_U" : resultBody.AppendHybridShape(axisULine)
-        Dim axisVLine As Object = factory.AddNewLinePtPt(part.CreateReferenceFromObject(centerPoint), part.CreateReferenceFromObject(vEnd))
-        axisVLine.Name = "Reference_Axis_V" : resultBody.AppendHybridShape(axisVLine)
-        Dim d As Double = -(fit.Normal.X * fit.Center.X + fit.Normal.Y * fit.Center.Y + fit.Normal.Z * fit.Center.Z)
-        Dim plane As Object = factory.AddNewPlaneEquation(fit.Normal.X, fit.Normal.Y, fit.Normal.Z, d)
-        plane.Name = "Fitted_Plane"
-        resultBody.AppendHybridShape(plane)
+
+        Dim axisULine As Object = FindShapeInBodyByName(resultBody, "Reference_Axis_U")
+        If axisULine Is Nothing Then
+            axisULine = factory.AddNewLinePtPt(part.CreateReferenceFromObject(centerPoint), part.CreateReferenceFromObject(uEnd))
+            axisULine.Name = "Reference_Axis_U" : resultBody.AppendHybridShape(axisULine)
+        End If
+        Dim axisVLine As Object = FindShapeInBodyByName(resultBody, "Reference_Axis_V")
+        If axisVLine Is Nothing Then
+            axisVLine = factory.AddNewLinePtPt(part.CreateReferenceFromObject(centerPoint), part.CreateReferenceFromObject(vEnd))
+            axisVLine.Name = "Reference_Axis_V" : resultBody.AppendHybridShape(axisVLine)
+        End If
+
+        Dim plane As Object = FindShapeInBodyByName(resultBody, "Fitted_Plane")
+        If plane Is Nothing Then
+            Dim d As Double = -(fit.Normal.X * fit.Center.X + fit.Normal.Y * fit.Center.Y + fit.Normal.Z * fit.Center.Z)
+            plane = factory.AddNewPlaneEquation(fit.Normal.X, fit.Normal.Y, fit.Normal.Z, d)
+            plane.Name = "Fitted_Plane"
+            resultBody.AppendHybridShape(plane)
+        End If
         part.Update()
+
+        Dim equationCurve As Object = FindShapeInBodyByName(resultBody, "LogSpiral_Standard_Equation")
+        If equationCurve Is Nothing Then
+            equationCurve = FindShapeInPart(part, "LogSpiral_Standard_Equation")
+        End If
+        If equationCurve Is Nothing Then
+            Throw New InvalidOperationException("模板文件中未找到原生 LogSpiral_Standard_Equation 曲线。")
+        End If
 
         Dim baseRadiusMm As Double = Math.Exp(fit.Alpha)
         Dim baseCircle As Object = factory.AddNewCircleCtrRad(part.CreateReferenceFromObject(centerPoint), part.CreateReferenceFromObject(plane), False, baseRadiusMm)
@@ -942,7 +1105,7 @@ Public Class CatiaRunner
 
         part.Update()
         Dim auxShapes() As Object = {centerPoint, uEnd, vEnd, axisULine, axisVLine, plane}
-        Return New Object() {resultBody, pSpiralA, baseCircle, auxShapes}
+        Return New Object() {resultBody, pSpiralA, baseCircle, auxShapes, equationCurve}
     End Function
 
     Private Shared Sub SetComPropertyPut(ByVal target As Object, ByVal propertyName As String, ByVal value As Object)
@@ -1116,23 +1279,28 @@ Public Class CatiaRunner
     Private Shared Function MeasureCurveStartDistanceToCenter(ByVal doc As Object, ByVal part As Object, ByVal tempBody As Object, ByVal curve As Object, ByVal center As Point3) As Double
         Dim factory As Object = part.HybridShapeFactory
         Dim curveRef As Object = part.CreateReferenceFromObject(curve)
-        Dim probePt As Object = factory.AddNewPointOnCurveFromPercent(curveRef, 0.0, False)
-        probePt.Name = "__ProbeStart"
-        tempBody.AppendHybridShape(probePt)
+        Dim probeStart As Object = factory.AddNewPointOnCurveFromPercent(curveRef, 0.0, False)
+        probeStart.Name = "__ProbeStart"
+        tempBody.AppendHybridShape(probeStart)
+        Dim probeEnd As Object = factory.AddNewPointOnCurveFromPercent(curveRef, 1.0, False)
+        probeEnd.Name = "__ProbeEnd"
+        tempBody.AppendHybridShape(probeEnd)
         Try
             part.Update()
-            Dim pr As Object = part.CreateReferenceFromObject(probePt)
-            Dim coordinates(2) As Object
-            doc.GetWorkbench("SPAWorkbench").GetMeasurable(pr).GetPoint(coordinates)
-            Dim dx As Double = CDbl(coordinates(0)) - center.X
-            Dim dy As Double = CDbl(coordinates(1)) - center.Y
-            Dim dz As Double = CDbl(coordinates(2)) - center.Z
-            Return Math.Sqrt(dx * dx + dy * dy + dz * dz)
+            Dim spa As Object = doc.GetWorkbench("SPAWorkbench")
+            Dim c0(2) As Object
+            spa.GetMeasurable(part.CreateReferenceFromObject(probeStart)).GetPoint(c0)
+            Dim d0 As Double = Math.Sqrt((CDbl(c0(0)) - center.X) ^ 2 + (CDbl(c0(1)) - center.Y) ^ 2 + (CDbl(c0(2)) - center.Z) ^ 2)
+            Dim c1(2) As Object
+            spa.GetMeasurable(part.CreateReferenceFromObject(probeEnd)).GetPoint(c1)
+            Dim d1 As Double = Math.Sqrt((CDbl(c1(0)) - center.X) ^ 2 + (CDbl(c1(1)) - center.Y) ^ 2 + (CDbl(c1(2)) - center.Z) ^ 2)
+            Return Math.Min(d0, d1)
         Finally
             Try
                 Dim sel As Object = doc.Selection
                 sel.Clear()
-                sel.Add(probePt)
+                sel.Add(probeStart)
+                sel.Add(probeEnd)
                 sel.Delete()
                 sel.Clear()
             Catch
@@ -1270,13 +1438,20 @@ Public Class CatiaRunner
 
         Dim outputDoc As Object = Nothing
         Dim tempBody As Object = Nothing
-        Dim stage As String = "copying and verifying source curve"
+        Dim stage As String = "preparing template and importing source curve"
         Try
             cancellation.ThrowIfCancellationRequested()
-            File.Copy(sourcePath, tempWorkPath, True)
+            File.Copy(templatePath, tempWorkPath, True)
+            Try
+                Dim attrs As FileAttributes = File.GetAttributes(tempWorkPath)
+                If (attrs And FileAttributes.ReadOnly) = FileAttributes.ReadOnly Then
+                    File.SetAttributes(tempWorkPath, attrs And Not FileAttributes.ReadOnly)
+                End If
+            Catch
+            End Try
             outputDoc = catia.Documents.Open(tempWorkPath)
             Dim outputPart As Object = outputDoc.Part
-            Dim curve As Object = ResolveCurveInCopiedPart(outputDoc, outputPart, choice)
+            Dim curve As Object = ImportSourceCurveIntoTemplatePart(catia, sourcePath, choice, outputDoc, outputPart)
 
             stage = "sampling"
             cancellation.ThrowIfCancellationRequested()
@@ -1296,7 +1471,7 @@ Public Class CatiaRunner
 
             stage = "building equation laws"
             If progress IsNot Nothing Then
-                progress(70, "[步骤 4/6] 正在创建参数化参考几何、基圆与命名参数…")
+                progress(70, "[步骤 4/6] 正在更新参数化参考几何、基圆与原生方程曲线…")
             End If
             Dim paramMap As Dictionary(Of String, Object) = Nothing
             Dim equationData() As Object = BuildEquationDefinition(outputDoc, outputPart, fit, paramMap)
@@ -1304,13 +1479,10 @@ Public Class CatiaRunner
             Dim pSpiralA As Object = equationData(1)
             Dim baseCircle As Object = equationData(2)
             Dim auxShapes() As Object = DirectCast(equationData(3), Object())
-
-            stage = "instantiating equation curve"
-            If progress IsNot Nothing Then progress(80, "[步骤 5/6] 正在生成并绑定原生 GSMCurveEquations 对数螺旋线…")
-            Dim equationCurve As Object = InstantiateEquationCurveFromTemplate(outputDoc, outputPart, resultBody, fit, templatePath)
+            Dim equationCurve As Object = equationData(4)
 
             stage = "verifying parameter binding"
-            If progress IsNot Nothing Then progress(88, "[步骤 5/6] 正在校验参数联动与内端基圆距离…")
+            If progress IsNot Nothing Then progress(85, "[步骤 5/6] 正在校验参数联动与内端基圆距离…")
             fit.InnerGapMm = VerifyEquationAndBaseCircleBinding(outputDoc, outputPart, tempBody, equationCurve, baseCircle, pSpiralA, fit)
             If reportReady IsNot Nothing Then reportReady(FormatParameterReport(fit, Double.NaN))
 

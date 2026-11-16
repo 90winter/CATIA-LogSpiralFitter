@@ -44,8 +44,8 @@
    - 令新极角 $\theta' = \theta - \theta_{\text{inner}}$，则内端起点处 $\theta'_{\text{start}} = 0$，外端为 $\theta'_{\text{end}} = \theta_{\text{outer}} - \theta_{\text{inner}}$，重参数化后的对数截距为：
      $$\alpha' = \alpha + b\theta_{\text{inner}}, \quad a = e^{\alpha'} = r_{\min}$$
    - **几何意义**：三维螺旋线空间轨迹完全不变（对任意参数 $t \in [0, 1]$，空间点 $\mathbf{C} + r(\theta'(t))(\cos\theta'(t)\,\mathbf{e}_U + \sin\theta'(t)\,\mathbf{e}_V)$ 恒等），而参数 $a = r(0)$ 直接等于螺旋线最内端起点半径（基圆半径），使螺旋线内端落在基圆上（当 $b \neq 0$ 时内端切向含径向分量 $ab$，与基圆相交而不共切）。
-   - **参数化联动与自检**：`Fitted_Center`、`Fitted_Plane`、`baseCircle.Radius` 及 `Base_Circle_Radius/Diameter` 均通过 `CreateOrUpdateFormula` 绑定到根参数；`EnsureCoordinateLawsBound` 自动识别粘贴后 Law 的本地化形式参数名（如 `长度.2` / `实数.1` 与 `FormalLength.1` / `FormalReal.1`）并用 `Law.Modify` 绑定到当前零件根参数；输出前通过 `VerifyEquationAndBaseCircleBinding` 临时把 `LogSpiral_a` 增加 `10 mm` 验证曲线内端与基圆同步移动，并记录内端到基圆实测间隙。
-   - **安全与原子性**：选线与运行前均校验 `doc.Saved`，并在副本中按 `BodyName` + `CurveName` + 实测弧长校验曲线一致性；缺失 `LogSpiral_PowerCopy.CATPart` 直接报错；工作在临时 `.CATPart` 中完成，取消或失败时自动关闭并清理全部临时产物与报告，仅在全部成功后再重命名为正式 `*_LogSpiralEquation.CATPart` 并恢复原 `DisplayFileAlerts` 设置。
+   - **参数化联动与自检**：工作文件直接以 `LogSpiral_PowerCopy.CATPart` 为底板复制创建，复用其原生 `LogSpiral_Equation` 下的 `LogSpiral_Standard_Equation`（`GSMCurveEquations`）与三条 `LogSpiral_X/Y/Z_StandardEquation` 法则及其根参数；`Fitted_Center`、`Fitted_Plane`、`baseCircle.Radius` 及 `Base_Circle_Radius/Diameter` 均通过 `CreateOrUpdateFormula` 绑定到根参数；输出前通过 `VerifyEquationAndBaseCircleBinding` 临时把 `LogSpiral_a` 增加 `10 mm`，同时测量曲线拓扑两端点（`0.0` 与 `1.0`）取较近端验证曲线内端与基圆同步移动，并记录内端到基圆实测间隙。
+   - **安全与原子性**：选线与运行前均校验 `doc.Saved`，并在源件临时副本中按 `BodyName` + `CurveName` + 实测弧长校验曲线一致性后导入（`PasteSpecial("CATPrtResultWithOutLink")`）；缺失 `LogSpiral_PowerCopy.CATPart` 直接报错；工作在临时 `.CATPart` 中完成，取消或失败时自动关闭并清理全部临时产物与报告，仅在全部成功后再重命名为正式 `*_LogSpiralEquation.CATPart` 并恢复原 `DisplayFileAlerts` 设置。
 
 ---
 
@@ -54,14 +54,14 @@
 ### 1. 为什么不用 CAA 工厂接口直接创建 `GSMCurveEquations`？
 已核查本机 CATIA V5R26（`C:\Program Files\Dassault Systemes\B26`）全部公开与受保护头文件（`CATIGSMFactory.h`、`CATIGSMUseFactory.h`、`CATIGSMUIFactory.h`）：达索仅公开了平面方程 `CATIGSMPlaneEquation` 与阿基米德螺线 `CATIGSMSpiral`，**从未公开 `GSMCurveEquations` 的 C++ 或 Automation 创建工厂**。因此采用包含预建 `GSMCurveEquations` 特征的模板文件 `LogSpiral_PowerCopy.CATPart` 进行自动复制与法则重绑，是无需人工点选且兼容性最好的方案。
 
-### 2. 免弹窗复制模板与消除“会话中是只读的”弹窗（`CopyTemplateEquationBySelection`）
-- **陷阱**：若先调用 `InstanceFactory.BeginInstanceFactory("LogSpiral_PowerCopy", templatePath)`，CATIA 内部会将 `templatePath` 以**会话只读**状态加载并驻留内存；随后若对同一路径调用 `Documents.Open(templatePath)`，CATIA 检测到磁盘文件有写权限而内存会话中为只读，会弹出模态确认框：`“LogSpiral_PowerCopy.CATPart 在会话中是只读的。是否要将此文档的权限更新为读/写？”`。
-- **解法**：
-  1. 不调用 `BeginInstanceFactory`；
-  2. 每次将 `LogSpiral_PowerCopy.CATPart` 复制到系统 `%TEMP%` 下带唯一 GUID 的临时路径 `__LogSpiral_Tpl_<GUID>.CATPart`，清除只读属性，并在 `catiaApp.DisplayFileAlerts = False` 保护下打开该临时副本；
-  3. 选中模板中的 3 条 Law 与 `LogSpiral_Standard_Equation` 执行 `Selection.Copy()`，切回目标文档选中 `LogSpiral_Equation` 几何集执行 `Selection.Paste()`；
-  4. 在 `Finally` 块中关闭临时文档、恢复 `DisplayFileAlerts = True` 并删除临时文件；
-  5. 调用 `EnsureCoordinateLawsBound`，通过 `Law.Modify("FormalLength.1 = ...")` 强制刷新目标文档 `part.Relations` 中的三条法则公式，使其 100% 绑定到当前目标 Part 的根参数 `Center_X`～`Axis_V_Z`。
+### 2. 免弹窗模板工作流：为什么必须以模板为底板导入源曲线（而非反向 Copy/Paste `GSMCurveEquations`）
+- **根因 1（会话只读弹窗）**：若调用 `InstanceFactory.BeginInstanceFactory("LogSpiral_PowerCopy", templatePath)`，CATIA 内部会将 `templatePath` 以**会话只读**状态加载并驻留内存，后续打开同路径时会弹出权限确认框。
+- **根因 2（跨文档复制粘贴导致参数断链）**：二进制检查 `Part9_LogSpiralEquation.CATPart` 与 `LogSpiral_PowerCopy.CATPart` 发现：通过 `Selection.Copy()`/`Paste()` 跨文档复制 `GSMCurveEquations` 与 3 条 Law 时，CATIA 会隐式把模板中的 13 个参数复制成带本地化默认名的孤立参数（`长度.2`、`长度.3`、`实数.1` 等），导致粘贴后的 `GSMCurveEquations` 仍绑定在冻结的模板值上；而即使修改 Law 文本，如果正文中先出现 `实数.1`（`LogSpiral_b`）而非 `FormalReal.1`，也会把形式参数识别错，造成修改 `LogSpiral_a` 后方程曲线完全不动（增量 `0.0000 mm`）。
+- **最终解法（Template-First + `ImportSourceCurveIntoTemplatePart`）**：
+  1. 不再跨文档 Copy/Paste `GSMCurveEquations` 和 3 条 Law，也不调用 `BeginInstanceFactory`；
+  2. 直接把 `LogSpiral_PowerCopy.CATPart` 复制到 `tempWorkPath`（去除只读属性）并打开作为目标工作文档——该模板内部原生创建的 `LogSpiral_Standard_Equation`、3 条 `LogSpiral_X/Y/Z_StandardEquation` 与 13 个根参数（`#1_..#8_`）之间的 C++ Spec 链接完好无损；
+  3. 清理模板中原有的多余几何体与 `LogSpiral_PowerCopy` 定义后，将源 `.CATPart` 复制到临时副本并保存/恢复 `DisplayFileAlerts`，校验并选中源曲线通过 `PasteSpecial("CATPrtResultWithOutLink")` 导入目标工作文档的源几何集进行采样；
+  4. `BuildEquationDefinition` 直接复用并更新 `LogSpiral_Equation` 下的参考几何与根参数，并通过 `CreateOrUpdateFormula` 绑定 `Fitted_Center`、`Fitted_Plane` 与基圆半径，最后通过 `VerifyEquationAndBaseCircleBinding` 实测 `+10 mm` 联动。
 
 ### 3. VB.NET 后期绑定 `0x80020003 (DISP_E_MEMBERNOTFOUND)` 两大陷阱
 - **陷阱 A**：不要在 VB.NET Late Binding 中调用 `Parameters.GetNameToUseInRelation`，部分 CATIA V5 版本返回 `DISP_E_MEMBERNOTFOUND`。在 Knowledgeware Law 公式中直接写根参数名（如 `Center_X`、`LogSpiral_a`）即可。
