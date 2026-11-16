@@ -7,11 +7,10 @@
 ## 一、运行环境与文件组成
 
 ### 独立运行程序包（`LogSpiralFitter_Program.zip`）
-解压后请保持以下文件在**同一文件夹**下：
+解压后请保持以下文件在**同一文件夹**下（直接双击 `LogSpiralFitter.exe` 启动）：
 - `LogSpiralFitter.exe`：主程序（内置对数螺旋线图标，仅依赖 Windows 自带 `.NET Framework 4.x`）
-- `LogSpiral_PowerCopy.CATPart`：原生方程曲线模板文件（**必须与 `LogSpiralFitter.exe` 同目录**，用于全自动免弹窗生成 `GSMCurveEquations`）
+- `LogSpiral_PowerCopy.CATPart`：原生方程曲线模板文件（**必须与 `LogSpiralFitter.exe` 同目录**，用于全自动免弹窗生成 `GSMCurveEquations`；缺失时程序将直接报错提示，不再弹出人工对话框）
 - `README_对数螺旋线拟合.md`：本操作说明文档
-- `Run_LogSpiral_Fitter.CATScript`：可选 CATIA 宏快捷启动入口
 
 ---
 
@@ -43,7 +42,9 @@
      名称自动标记为完整参数说明，例如：
      `对数螺旋线_r=84.987*exp(0.04440*θ)_a=84.987mm_b=0.044400_θ=0.0deg~294.9deg`
    - **基圆（Base Circle）**：
-     名称为 `基圆_R={a}mm_D={2a}mm`（例如 `基圆_R=84.987mm_D=169.973mm`），位于拟合平面上、以拟合中心为圆心、半径严格等于螺旋线内圈起点半径 $r_0 = a$，与螺旋线内端起点相接。
+     名称为 `基圆_R={a}mm_D={2a}mm`（例如 `基圆_R=84.987mm_D=169.973mm`），位于拟合平面上、以 `Fitted_Center` 为圆心、半径通过公式绑定到 `LogSpiral_a`（与螺旋线内端起点半径 $r_0 = a$ 一致，内端落在基圆上；注：当 $b \neq 0$ 时螺旋线内端切向含径向分量 $ab$，与基圆相交而不共切）。
+   - **参数化联动**：
+     `Fitted_Center` 坐标、`Fitted_Plane` 方程、`Base_Circle_Radius/Diameter` 与基圆半径均通过 CATIA 公式（Formula）关联到根参数 `Center_X/Y/Z`、`LogSpiral_a` 等；三条 Law 绑定到目标零件的根参数，修改 `LogSpiral_a`、`Center_X/Y/Z` 等参数并更新零件后，方程曲线与基圆同步更新。程序在输出前会自动执行一次 `+10 mm` 参数联动自检与内端到基圆距离测量。
    - **辅助参考几何（保留在结构树中，默认隐藏 NoShow）**：
      - `Fitted_Center`：拟合螺旋中心点
      - `Reference_Axis_U`（$\theta = 0^\circ$ 轴，从圆心指向螺旋线内圈最里端起点）、`Reference_Axis_V`（$\theta = 90^\circ$ 正交轴）及端点 `Reference_U_End`、`Reference_V_End`
@@ -60,8 +61,8 @@
    - `Axis_U_X/Y/Z`、`Axis_V_X/Y/Z`、`Plane_Normal_X/Y/Z`
    - `Fit_RMS_Error`、`Fit_Max_Error`、`Fit_R2`
 5. **隐藏的过程数据文件（同目录下，Windows 隐藏属性）**：
-   - `*_report.json`：完整拟合参数与误差报告
-   - `*_samples.csv`：全部采样点三维坐标、极角与径向残差明细
+   - `*_report.json`：完整拟合参数与误差报告（含平面内法向残差、平面内径向残差、离平面 RMS/最大偏差、内端到基圆实测间隙）
+   - `*_samples.csv`：全部采样点三维坐标、极角、`in_plane_normal_residual_mm`（平面内法向残差）与 `in_plane_radial_residual_mm`（平面内径向残差）明细
 
 ---
 
@@ -78,7 +79,7 @@
    $$\mathbf{e}_U' = \cos\theta_0\,\mathbf{e}_U + \sin\theta_0\,\mathbf{e}_V, \quad \mathbf{e}_V' = -\sin\theta_0\,\mathbf{e}_U + \cos\theta_0\,\mathbf{e}_V$$
    在新基准下，极角 $\theta' = \theta - \theta_0$ 从内端起点 $\theta'_{\text{start}} = 0^\circ$ 开始，标准方程为：
    $$r(\theta') = a \cdot e^{b\theta'}, \quad a = r(0) = r_{\min}$$
-   三维曲线轨迹完全不变，而 $a$ 直接等于内圈基圆半径，基圆与螺旋线内端起点精确相接。
+   三维曲线轨迹完全不变，而 $a$ 直接等于内圈基圆半径，使螺旋线内端落在基圆上（仅支持任意朝向的平面对数螺旋线；若离平面偏差、展开角或 $b$ 值异常，报告会给出退化警告）。
 
 ---
 

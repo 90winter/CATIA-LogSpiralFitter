@@ -3,6 +3,7 @@ Option Strict Off
 Imports System
 Imports System.IO
 Imports System.Text
+Imports System.Text.RegularExpressions
 Imports System.Globalization
 Imports System.Runtime.InteropServices
 Imports System.Collections.Generic
@@ -31,6 +32,7 @@ Public Class CenterEvaluation
     Public B As Double
     Public Theta() As Double
     Public Residual() As Double
+    Public RadialResidual() As Double
 End Class
 
 Public Class FitResult
@@ -46,13 +48,19 @@ Public Class FitResult
     Public ThetaEnd As Double
     Public RmsError As Double
     Public MaxError As Double
+    Public RadialRmsError As Double
+    Public RadialMaxError As Double
+    Public PlanarityRms As Double
     Public PlanarityMax As Double
     Public R2 As Double
     Public SampleSpacingMm As Double
     Public SampleCount As Integer
+    Public InnerGapMm As Double = Double.NaN
+    Public Warnings As New List(Of String)()
     Public SourcePoints() As Point3
     Public Theta() As Double
     Public Residual() As Double
+    Public RadialResidual() As Double
 End Class
 
 Public Module VectorMath
@@ -132,12 +140,14 @@ Public Class SpiralMath
         Dim b As Double = sTL / sTT
         Dim alpha As Double = meanL - b * meanT
         Dim residual(n - 1) As Double
+        Dim radialResidual(n - 1) As Double
         Dim objective As Double = 0.0
         Dim delta As Double = Math.Max(robustScale, 1.0E-5)
         Dim denom As Double = Math.Sqrt(1.0 + b * b)
         For i As Integer = 0 To n - 1
             Dim e As Double = (logs(i) - alpha - b * theta(i)) * radii(i) / denom
             residual(i) = e
+            radialResidual(i) = Math.Exp(alpha + b * theta(i)) - radii(i)
             Dim ae As Double = Math.Abs(e)
             If ae <= delta Then
                 objective += 0.5 * e * e
@@ -146,7 +156,7 @@ Public Class SpiralMath
             End If
         Next
         objective /= n
-        Return New CenterEvaluation With {.Objective = objective, .Alpha = alpha, .B = b, .Theta = theta, .Residual = residual}
+        Return New CenterEvaluation With {.Objective = objective, .Alpha = alpha, .B = b, .Theta = theta, .Residual = residual, .RadialResidual = radialResidual}
     End Function
 
     Private Shared Function PenalizedObjective(ByVal points() As Point2, ByVal x As Double, ByVal y As Double, ByVal c0 As Point2, ByVal limit As Double, ByVal robustScale As Double) As Double
@@ -304,11 +314,15 @@ Public Class SpiralMath
         Dim axisV As Point3 = VectorMath.Normalize(VectorMath.Cross(normal, axisU))
         Dim planar(source.Length - 1) As Point2
         Dim maxPlane As Double = 0.0
+        Dim sumPlanSq As Double = 0.0
         For i As Integer = 0 To source.Length - 1
             Dim d As Point3 = VectorMath.Subtract(source(i), origin)
             planar(i) = New Point2(VectorMath.Dot(d, axisU), VectorMath.Dot(d, axisV))
-            maxPlane = Math.Max(maxPlane, Math.Abs(VectorMath.Dot(d, normal)))
+            Dim planDev As Double = VectorMath.Dot(d, normal)
+            maxPlane = Math.Max(maxPlane, Math.Abs(planDev))
+            sumPlanSq += planDev * planDev
         Next
+        Dim planarityRms As Double = Math.Sqrt(sumPlanSq / source.Length)
         Dim minX As Double = planar(0).X, maxX As Double = minX, minY As Double = planar(0).Y, maxY As Double = minY
         Dim meanX As Double = 0.0, meanY As Double = 0.0
         For Each p As Point2 In planar
@@ -343,6 +357,10 @@ Public Class SpiralMath
         For Each e As Double In eval.Residual
             sumSq += e * e : maxErr = Math.Max(maxErr, Math.Abs(e))
         Next
+        Dim radSumSq As Double = 0.0, radMaxErr As Double = 0.0
+        For Each re As Double In eval.RadialResidual
+            radSumSq += re * re : radMaxErr = Math.Max(radMaxErr, Math.Abs(re))
+        Next
         Dim logs(planar.Length - 1) As Double, meanLog As Double = 0.0
         For i As Integer = 0 To planar.Length - 1
             Dim dx As Double = planar(i).X - best.X, dy As Double = planar(i).Y - best.Y
@@ -370,19 +388,33 @@ Public Class SpiralMath
         For i As Integer = 0 To eval.Theta.Length - 1
             alignedTheta(i) = eval.Theta(i) - theta0
         Next
+        Dim warnings As New List(Of String)()
+        If maxPlane > Math.Max(1.0, diag * 0.02) Then
+            warnings.Add(String.Format(CultureInfo.InvariantCulture, "警告：最大离平面偏差为 {0:F3} mm（平面 RMS {1:F3} mm），本工具仅适用于平面对数螺旋线。", maxPlane, planarityRms))
+        End If
+        If Math.Abs(thetaOuter) < 15.0 * Math.PI / 180.0 Then
+            warnings.Add(String.Format(CultureInfo.InvariantCulture, "警告：曲线展开角仅 {0:F2}°（小于 15°），拟合中心与 b 值可能不稳定。", Math.Abs(thetaOuter) * 180.0 / Math.PI))
+        End If
+        If Math.Abs(eval.B) > 1.5 Then
+            warnings.Add(String.Format(CultureInfo.InvariantCulture, "警告：|b| = {0:F4} 过大，曲线接近直线或极度发散，拟合精度可能受限。", Math.Abs(eval.B)))
+        End If
         Return New FitResult With {
             .Center = center3, .PlaneOrigin = origin, .AxisU = alignedU, .AxisV = alignedV, .Normal = normal,
             .Center2 = best, .Alpha = alignedAlpha, .B = eval.B,
             .ThetaStart = 0.0, .ThetaEnd = thetaOuter,
             .RmsError = Math.Sqrt(sumSq / eval.Residual.Length), .MaxError = maxErr,
-            .PlanarityMax = maxPlane, .R2 = If(ssTot > 0, 1.0 - ssRes / ssTot, 1.0),
-            .SourcePoints = source, .Theta = alignedTheta, .Residual = eval.Residual}
+            .RadialRmsError = Math.Sqrt(radSumSq / eval.RadialResidual.Length), .RadialMaxError = radMaxErr,
+            .PlanarityRms = planarityRms, .PlanarityMax = maxPlane,
+            .R2 = If(ssTot > 0, 1.0 - ssRes / ssTot, 1.0),
+            .Warnings = warnings,
+            .SourcePoints = source, .Theta = alignedTheta, .Residual = eval.Residual, .RadialResidual = eval.RadialResidual}
     End Function
 End Class
 
 Public Class CurveChoice
     Public DocumentPath As String
     Public DocumentName As String
+    Public BodyName As String
     Public CurveName As String
     Public BodyIndex As Integer
     Public ShapeIndex As Integer
@@ -442,6 +474,14 @@ Public Class CatiaRunner
         If String.IsNullOrWhiteSpace(documentPath) OrElse Not File.Exists(documentPath) Then
             Throw New InvalidOperationException("请先保存当前 CATPart。")
         End If
+        Try
+            If Not CBool(doc.Saved) Then
+                Throw New InvalidOperationException("当前 CATPart 存在未保存的修改，请先在 CATIA 中保存后再选择曲线。")
+            End If
+        Catch ex As InvalidOperationException
+            Throw
+        Catch
+        End Try
 
         doc.Activate()
         Dim selection As Object = doc.Selection
@@ -458,6 +498,7 @@ Public Class CatiaRunner
         Dim selectedName As String = CStr(selectedObject.Name)
         Dim bodyIndex As Integer = 0, shapeIndex As Integer = 0
         Dim curve As Object = FindSelectedCurve(doc.Part, selectedObject, bodyIndex, shapeIndex)
+        Dim bodyName As String = CStr(doc.Part.HybridBodies.Item(bodyIndex).Name)
         Dim reference As Object = doc.Part.CreateReferenceFromObject(curve)
         Dim measurable As Object = doc.GetWorkbench("SPAWorkbench").GetMeasurable(reference)
         Dim lengthMm As Double
@@ -472,11 +513,63 @@ Public Class CatiaRunner
         Return New CurveChoice With {
             .DocumentPath = documentPath,
             .DocumentName = CStr(doc.Name),
+            .BodyName = bodyName,
             .CurveName = selectedName,
             .BodyIndex = bodyIndex,
             .ShapeIndex = shapeIndex,
             .LengthMm = lengthMm
         }
+    End Function
+
+    Private Shared Function ResolveCurveInCopiedPart(ByVal doc As Object, ByVal part As Object, ByVal choice As CurveChoice) As Object
+        Dim bodies As Object = part.HybridBodies
+        Dim targetBody As Object = Nothing
+        For i As Integer = 1 To CInt(bodies.Count)
+            Dim b As Object = bodies.Item(i)
+            If String.Equals(CStr(b.Name), choice.BodyName, StringComparison.OrdinalIgnoreCase) Then
+                targetBody = b
+                Exit For
+            End If
+        Next
+        If targetBody Is Nothing AndAlso choice.BodyIndex >= 1 AndAlso choice.BodyIndex <= CInt(bodies.Count) Then
+            Dim byIdx As Object = bodies.Item(choice.BodyIndex)
+            If String.IsNullOrEmpty(choice.BodyName) OrElse String.Equals(CStr(byIdx.Name), choice.BodyName, StringComparison.OrdinalIgnoreCase) Then
+                targetBody = byIdx
+            End If
+        End If
+        If targetBody Is Nothing Then
+            Throw New InvalidOperationException("磁盘副本中未找到几何图形集 '" & choice.BodyName & "'，可能文件已更改或未保存，请重新选线。")
+        End If
+
+        Dim matches As New List(Of Object)()
+        Dim shapes As Object = targetBody.HybridShapes
+        For j As Integer = 1 To CInt(shapes.Count)
+            Dim s As Object = shapes.Item(j)
+            If String.Equals(CStr(s.Name), choice.CurveName, StringComparison.OrdinalIgnoreCase) Then
+                matches.Add(s)
+            End If
+        Next
+        Dim resolved As Object = Nothing
+        If matches.Count = 1 Then
+            resolved = matches(0)
+        ElseIf matches.Count > 1 AndAlso choice.ShapeIndex >= 1 AndAlso choice.ShapeIndex <= CInt(shapes.Count) Then
+            Dim byShapeIdx As Object = shapes.Item(choice.ShapeIndex)
+            If String.Equals(CStr(byShapeIdx.Name), choice.CurveName, StringComparison.OrdinalIgnoreCase) Then
+                resolved = byShapeIdx
+            Else
+                resolved = matches(0)
+            End If
+        End If
+        If resolved Is Nothing Then
+            Throw New InvalidOperationException("磁盘副本中未找到曲线 '" & choice.CurveName & "'，可能文件已更改或未保存，请重新选线。")
+        End If
+
+        Dim copiedLen As Double = MeasureCurveLength(doc, part, resolved)
+        Dim tol As Double = Math.Max(0.01, choice.LengthMm * 0.0001)
+        If Double.IsNaN(copiedLen) OrElse Math.Abs(copiedLen - choice.LengthMm) > tol Then
+            Throw New InvalidOperationException(String.Format(Inv, "磁盘副本中的曲线 '{0}' 长度 ({1:F3} mm) 与所选曲线 ({2:F3} mm) 不一致，请先保存源文件并重新选线。", choice.CurveName, copiedLen, choice.LengthMm))
+        End If
+        Return resolved
     End Function
 
     Public Shared Function ComputeSampleCount(ByVal curveLengthMm As Double, ByVal spacingMm As Double) As Integer
@@ -551,27 +644,60 @@ Public Class CatiaRunner
         selection.Clear()
     End Sub
 
-    Private Shared Sub AddParameter(ByVal parameters As Object, ByVal name As String, ByVal value As String)
-        parameters.CreateString(name, value)
+    Private Shared Function FindParameterByName(ByVal parameters As Object, ByVal name As String) As Object
+        Try
+            Return parameters.Item(name)
+        Catch
+            Return Nothing
+        End Try
+    End Function
+
+    Private Shared Sub SetOrCreateStringParameter(ByVal parameters As Object, ByVal name As String, ByVal value As String)
+        Dim existing As Object = FindParameterByName(parameters, name)
+        If existing IsNot Nothing Then
+            existing.Value = value
+        Else
+            parameters.CreateString(name, value)
+        End If
     End Sub
 
-    Private Shared Function AddLengthParameter(ByVal parameters As Object, ByVal name As String, ByVal valueMm As Double) As Object
-        Dim parameter As Object = parameters.CreateDimension(name, "LENGTH", 0.0)
+    Private Shared Function SetOrCreateLengthParameter(ByVal parameters As Object, ByVal name As String, ByVal valueMm As Double) As Object
+        Dim parameter As Object = FindParameterByName(parameters, name)
+        If parameter Is Nothing Then
+            parameter = parameters.CreateDimension(name, "LENGTH", 0.0)
+        End If
         parameter.ValuateFromString(valueMm.ToString("R", Inv) & "mm")
         Return parameter
     End Function
 
-    Private Shared Function AddAngleParameter(ByVal parameters As Object, ByVal name As String, ByVal valueRad As Double) As Object
-        Dim parameter As Object = parameters.CreateDimension(name, "ANGLE", 0.0)
+    Private Shared Function SetOrCreateAngleParameter(ByVal parameters As Object, ByVal name As String, ByVal valueRad As Double) As Object
+        Dim parameter As Object = FindParameterByName(parameters, name)
+        If parameter Is Nothing Then
+            parameter = parameters.CreateDimension(name, "ANGLE", 0.0)
+        End If
         parameter.ValuateFromString(valueRad.ToString("R", Inv) & "rad")
         Return parameter
     End Function
 
-    Private Shared Function AddRealParameter(ByVal parameters As Object, ByVal name As String, ByVal value As Double) As Object
+    Private Shared Function SetOrCreateRealParameter(ByVal parameters As Object, ByVal name As String, ByVal value As Double) As Object
+        Dim parameter As Object = FindParameterByName(parameters, name)
+        If parameter IsNot Nothing Then
+            parameter.Value = value
+            Return parameter
+        End If
         Return parameters.CreateReal(name, value)
     End Function
 
-    Private Shared Function GetCoordinateLawExpressions(ByVal fit As FitResult) As String()
+    Private Shared Sub CreateOrUpdateFormula(ByVal relations As Object, ByVal formulaName As String, ByVal targetParam As Object, ByVal expression As String)
+        Dim existing As Object = FindRelationByNameOrPrefix(relations, formulaName)
+        If existing IsNot Nothing Then
+            existing.Modify(expression)
+        Else
+            relations.CreateFormula(formulaName, "", targetParam, expression)
+        End If
+    End Sub
+
+    Private Shared Function GetCoordinateLawExpressions(ByVal formalRealName As String) As String()
         ' Root parameter names can be referenced directly by Knowledgeware laws.
         ' Avoid Parameters.GetNameToUseInRelation here: some CATIA V5 releases do not expose
         ' that method through late-bound VB.NET COM and return DISP_E_MEMBERNOTFOUND.
@@ -588,7 +714,7 @@ Public Class CatiaRunner
         Dim axisVXName As String = "Axis_V_X"
         Dim axisVYName As String = "Axis_V_Y"
         Dim axisVZName As String = "Axis_V_Z"
-        Dim thetaExpr As String = "(" & thetaStartName & "+(" & thetaEndName & "-" & thetaStartName & ")*FormalReal.1)"
+        Dim thetaExpr As String = "(" & thetaStartName & "+(" & thetaEndName & "-" & thetaStartName & ")*" & formalRealName & ")"
         Dim radialExpr As String = "(" & spiralAName & "*exp(" & spiralBName & "*(" & thetaExpr & ")/1rad))"
         Dim xExpr As String = centerXName & "+" & radialExpr & "*(" & axisUXName & "*cos(" & thetaExpr & ")+" & axisVXName & "*sin(" & thetaExpr & "))"
         Dim yExpr As String = centerYName & "+" & radialExpr & "*(" & axisUYName & "*cos(" & thetaExpr & ")+" & axisVYName & "*sin(" & thetaExpr & "))"
@@ -625,15 +751,73 @@ Public Class CatiaRunner
         Return If(exactMatch IsNot Nothing, exactMatch, prefixMatch)
     End Function
 
-    Private Shared Sub EnsureCoordinateLawsBound(ByVal relations As Object, ByVal exprs() As String)
-        Dim lawNames() As String = {"LogSpiral_X_StandardEquation", "LogSpiral_Y_StandardEquation", "LogSpiral_Z_StandardEquation"}
-        For idx As Integer = 0 To 2
-            Dim law As Object = FindRelationByNameOrPrefix(relations, lawNames(idx))
-            If law IsNot Nothing Then
-                law.Modify("FormalLength.1 = " & exprs(idx))
-            Else
-                CreateCoordinateLaw(relations, lawNames(idx), exprs(idx))
+    Private Shared Function DetectLawFormalOutput(ByVal law As Object, ByVal oldBody As String) As String
+        Dim eqIdx As Integer = oldBody.IndexOf("="c)
+        If eqIdx > 0 Then
+            Return oldBody.Substring(0, eqIdx).Trim()
+        End If
+        Try
+            If CInt(law.NbOutParameters) >= 1 Then
+                Return CStr(law.OutParameter(1).Name)
             End If
+        Catch
+        End Try
+        Return "FormalLength.1"
+    End Function
+
+    Private Shared Function DetectLawFormalReal(ByVal law As Object, ByVal oldBody As String) As String
+        Dim m As Match = Regex.Match(oldBody, "(FormalReal\.\d+|实数\.\d+)")
+        If m.Success Then
+            Return m.Value
+        End If
+        Try
+            Dim nbIn As Integer = CInt(law.NbInParameters)
+            For k As Integer = 1 To nbIn
+                Dim pName As String = CStr(law.InParameter(k).Name)
+                If pName.StartsWith("FormalReal.", StringComparison.OrdinalIgnoreCase) OrElse pName.StartsWith("实数.", StringComparison.Ordinal) Then
+                    Return pName
+                End If
+            Next
+        Catch
+        End Try
+        Return "FormalReal.1"
+    End Function
+
+    Private Shared Sub EnsureCoordinateLawsBound(ByVal relations As Object, ByVal relCountBefore As Integer)
+        Dim lawNames() As String = {"LogSpiral_X_StandardEquation", "LogSpiral_Y_StandardEquation", "LogSpiral_Z_StandardEquation"}
+        Dim totalCount As Integer = CInt(relations.Count)
+        For idx As Integer = 0 To 2
+            Dim targetBase As String = lawNames(idx)
+            Dim law As Object = Nothing
+            For i As Integer = totalCount To relCountBefore + 1 Step -1
+                Dim candidate As Object = relations.Item(i)
+                Dim rName As String = ""
+                Try
+                    rName = CStr(candidate.Name)
+                Catch
+                End Try
+                If String.Equals(rName, targetBase, StringComparison.OrdinalIgnoreCase) OrElse
+                   rName.StartsWith(targetBase & ".", StringComparison.OrdinalIgnoreCase) Then
+                    law = candidate
+                    Exit For
+                End If
+            Next
+            If law Is Nothing Then
+                law = FindRelationByNameOrPrefix(relations, targetBase)
+            End If
+            If law Is Nothing Then
+                Throw New InvalidOperationException("未找到复制后的方程法则: " & targetBase)
+            End If
+            Dim oldBody As String = ""
+            Try
+                oldBody = CStr(law.Value)
+            Catch
+            End Try
+            Dim lhsName As String = DetectLawFormalOutput(law, oldBody)
+            Dim formalRealName As String = DetectLawFormalReal(law, oldBody)
+            Dim exprs() As String = GetCoordinateLawExpressions(formalRealName)
+            law.Modify(lhsName & " = " & exprs(idx))
+            Try : law.Activate() : Catch : End Try
         Next
     End Sub
 
@@ -665,7 +849,7 @@ Public Class CatiaRunner
         File.SetAttributes(filePath, File.GetAttributes(filePath) Or FileAttributes.Hidden)
     End Sub
 
-    Private Shared Function BuildEquationDefinition(ByVal doc As Object, ByVal part As Object, ByVal fit As FitResult, ByVal createLaws As Boolean, ByRef paramMap As Dictionary(Of String, Object)) As Object()
+    Private Shared Function BuildEquationDefinition(ByVal doc As Object, ByVal part As Object, ByVal fit As FitResult, ByRef paramMap As Dictionary(Of String, Object)) As Object()
         Dim factory As Object = part.HybridShapeFactory
         Dim resultBody As Object = part.HybridBodies.Add()
         resultBody.Name = "LogSpiral_Equation"
@@ -700,30 +884,45 @@ Public Class CatiaRunner
 
         Dim parameters As Object = part.Parameters
         Dim relations As Object = part.Relations
-        AddParameter(parameters, "LogSpiral_Model", "r = LogSpiral_a * exp(LogSpiral_b * theta)")
-        Dim pCenterX As Object = AddLengthParameter(parameters, "Center_X", fit.Center.X)
-        Dim pCenterY As Object = AddLengthParameter(parameters, "Center_Y", fit.Center.Y)
-        Dim pCenterZ As Object = AddLengthParameter(parameters, "Center_Z", fit.Center.Z)
-        Dim pSpiralA As Object = AddLengthParameter(parameters, "LogSpiral_a", baseRadiusMm)
-        Dim pSpiralB As Object = AddRealParameter(parameters, "LogSpiral_b", fit.B)
-        Dim pThetaStart As Object = AddAngleParameter(parameters, "Theta_Start", fit.ThetaStart)
-        Dim pThetaEnd As Object = AddAngleParameter(parameters, "Theta_End", fit.ThetaEnd)
-        Dim pAxisUX As Object = AddRealParameter(parameters, "Axis_U_X", fit.AxisU.X)
-        Dim pAxisUY As Object = AddRealParameter(parameters, "Axis_U_Y", fit.AxisU.Y)
-        Dim pAxisUZ As Object = AddRealParameter(parameters, "Axis_U_Z", fit.AxisU.Z)
-        Dim pAxisVX As Object = AddRealParameter(parameters, "Axis_V_X", fit.AxisV.X)
-        Dim pAxisVY As Object = AddRealParameter(parameters, "Axis_V_Y", fit.AxisV.Y)
-        Dim pAxisVZ As Object = AddRealParameter(parameters, "Axis_V_Z", fit.AxisV.Z)
-        AddLengthParameter(parameters, "Base_Circle_Radius", baseRadiusMm)
-        AddLengthParameter(parameters, "Base_Circle_Diameter", baseRadiusMm * 2.0)
-        AddRealParameter(parameters, "Plane_Normal_X", fit.Normal.X)
-        AddRealParameter(parameters, "Plane_Normal_Y", fit.Normal.Y)
-        AddRealParameter(parameters, "Plane_Normal_Z", fit.Normal.Z)
-        AddLengthParameter(parameters, "Fit_RMS_Error", fit.RmsError)
-        AddLengthParameter(parameters, "Fit_Max_Error", fit.MaxError)
-        AddRealParameter(parameters, "Fit_R2", fit.R2)
-        AddParameter(parameters, "LogSpiral_Rotation", If(fit.ThetaEnd < fit.ThetaStart, "negative_about_normal", "positive_about_normal"))
-        AddParameter(parameters, "LogSpiral_Representation", "Native GSMCurveEquations driven by named standard-equation parameters; no spline")
+        SetOrCreateStringParameter(parameters, "LogSpiral_Model", "r = LogSpiral_a * exp(LogSpiral_b * theta)")
+        Dim pCenterX As Object = SetOrCreateLengthParameter(parameters, "Center_X", fit.Center.X)
+        Dim pCenterY As Object = SetOrCreateLengthParameter(parameters, "Center_Y", fit.Center.Y)
+        Dim pCenterZ As Object = SetOrCreateLengthParameter(parameters, "Center_Z", fit.Center.Z)
+        Dim pSpiralA As Object = SetOrCreateLengthParameter(parameters, "LogSpiral_a", baseRadiusMm)
+        Dim pSpiralB As Object = SetOrCreateRealParameter(parameters, "LogSpiral_b", fit.B)
+        Dim pThetaStart As Object = SetOrCreateAngleParameter(parameters, "Theta_Start", fit.ThetaStart)
+        Dim pThetaEnd As Object = SetOrCreateAngleParameter(parameters, "Theta_End", fit.ThetaEnd)
+        Dim pAxisUX As Object = SetOrCreateRealParameter(parameters, "Axis_U_X", fit.AxisU.X)
+        Dim pAxisUY As Object = SetOrCreateRealParameter(parameters, "Axis_U_Y", fit.AxisU.Y)
+        Dim pAxisUZ As Object = SetOrCreateRealParameter(parameters, "Axis_U_Z", fit.AxisU.Z)
+        Dim pAxisVX As Object = SetOrCreateRealParameter(parameters, "Axis_V_X", fit.AxisV.X)
+        Dim pAxisVY As Object = SetOrCreateRealParameter(parameters, "Axis_V_Y", fit.AxisV.Y)
+        Dim pAxisVZ As Object = SetOrCreateRealParameter(parameters, "Axis_V_Z", fit.AxisV.Z)
+        Dim pBaseRadius As Object = SetOrCreateLengthParameter(parameters, "Base_Circle_Radius", baseRadiusMm)
+        Dim pBaseDiameter As Object = SetOrCreateLengthParameter(parameters, "Base_Circle_Diameter", baseRadiusMm * 2.0)
+        SetOrCreateRealParameter(parameters, "Plane_Normal_X", fit.Normal.X)
+        SetOrCreateRealParameter(parameters, "Plane_Normal_Y", fit.Normal.Y)
+        SetOrCreateRealParameter(parameters, "Plane_Normal_Z", fit.Normal.Z)
+        SetOrCreateLengthParameter(parameters, "Fit_RMS_Error", fit.RmsError)
+        SetOrCreateLengthParameter(parameters, "Fit_Max_Error", fit.MaxError)
+        SetOrCreateRealParameter(parameters, "Fit_R2", fit.R2)
+        SetOrCreateStringParameter(parameters, "LogSpiral_Rotation", If(fit.ThetaEnd < fit.ThetaStart, "negative_about_normal", "positive_about_normal"))
+        SetOrCreateStringParameter(parameters, "LogSpiral_Representation", "Native GSMCurveEquations driven by named standard-equation parameters; no spline")
+
+        ' Parameterize Fitted_Center, Fitted_Plane, and Base Circle so editing Center_X/Y/Z or LogSpiral_a updates all geometry.
+        CreateOrUpdateFormula(relations, "Formula_FittedCenter_X", centerPoint.X, "Center_X")
+        CreateOrUpdateFormula(relations, "Formula_FittedCenter_Y", centerPoint.Y, "Center_Y")
+        CreateOrUpdateFormula(relations, "Formula_FittedCenter_Z", centerPoint.Z, "Center_Z")
+        Try
+            CreateOrUpdateFormula(relations, "Formula_FittedPlane_A", plane.A, "Plane_Normal_X")
+            CreateOrUpdateFormula(relations, "Formula_FittedPlane_B", plane.B, "Plane_Normal_Y")
+            CreateOrUpdateFormula(relations, "Formula_FittedPlane_C", plane.C, "Plane_Normal_Z")
+            CreateOrUpdateFormula(relations, "Formula_FittedPlane_D", plane.D, "-(Plane_Normal_X*Center_X+Plane_Normal_Y*Center_Y+Plane_Normal_Z*Center_Z)")
+        Catch
+        End Try
+        CreateOrUpdateFormula(relations, "Formula_BaseCircle_Radius", baseCircle.Radius, "LogSpiral_a")
+        CreateOrUpdateFormula(relations, "Formula_BaseCircle_Radius_Param", pBaseRadius, "LogSpiral_a")
+        CreateOrUpdateFormula(relations, "Formula_BaseCircle_Diameter_Param", pBaseDiameter, "2*LogSpiral_a")
 
         paramMap = New Dictionary(Of String, Object)(StringComparer.Ordinal) From {
             {"Center_X", pCenterX},
@@ -741,18 +940,9 @@ Public Class CatiaRunner
             {"Axis_V_Z", pAxisVZ}
         }
 
-        Dim lawX As Object = Nothing
-        Dim lawY As Object = Nothing
-        Dim lawZ As Object = Nothing
-        If createLaws Then
-            Dim exprs() As String = GetCoordinateLawExpressions(fit)
-            lawX = CreateCoordinateLaw(relations, "LogSpiral_X_StandardEquation", exprs(0))
-            lawY = CreateCoordinateLaw(relations, "LogSpiral_Y_StandardEquation", exprs(1))
-            lawZ = CreateCoordinateLaw(relations, "LogSpiral_Z_StandardEquation", exprs(2))
-        End If
         part.Update()
         Dim auxShapes() As Object = {centerPoint, uEnd, vEnd, axisULine, axisVLine, plane}
-        Return New Object() {resultBody, lawX, lawY, lawZ, baseCircle, auxShapes}
+        Return New Object() {resultBody, pSpiralA, baseCircle, auxShapes}
     End Function
 
     Private Shared Sub SetComPropertyPut(ByVal target As Object, ByVal propertyName As String, ByVal value As Object)
@@ -836,6 +1026,8 @@ Public Class CatiaRunner
         Catch
         End Try
 
+        Dim prevAlerts As Boolean = True
+        Try : prevAlerts = CBool(catiaApp.DisplayFileAlerts) : Catch : End Try
         Try : catiaApp.DisplayFileAlerts = False : Catch : End Try
         Dim tplDoc As Object = Nothing
         Try
@@ -877,7 +1069,7 @@ Public Class CatiaRunner
             If tplDoc IsNot Nothing Then
                 Try : tplDoc.Close() : Catch : End Try
             End If
-            Try : catiaApp.DisplayFileAlerts = True : Catch : End Try
+            Try : catiaApp.DisplayFileAlerts = prevAlerts : Catch : End Try
             Try
                 If File.Exists(tempTplPath) Then File.Delete(tempTplPath)
             Catch
@@ -885,7 +1077,7 @@ Public Class CatiaRunner
         End Try
     End Sub
 
-    Private Shared Function InstantiateEquationCurveFromPowerCopy(ByVal doc As Object, ByVal part As Object, ByVal resultBody As Object, ByVal paramMap As Dictionary(Of String, Object), ByVal fit As FitResult, ByVal templatePath As String) As Object
+    Private Shared Function InstantiateEquationCurveFromTemplate(ByVal doc As Object, ByVal part As Object, ByVal resultBody As Object, ByVal fit As FitResult, ByVal templatePath As String) As Object
         Dim subStep As String = "init"
         Try
             doc.Activate()
@@ -893,6 +1085,7 @@ Public Class CatiaRunner
             Dim initialResultShapeCount As Integer = CInt(resultBody.HybridShapes.Count)
             Dim initialBodyCount As Integer = CInt(part.HybridBodies.Count)
             Dim initialCounts As Dictionary(Of Integer, Integer) = SnapshotHybridShapeCounts(part)
+            Dim relCountBefore As Integer = CInt(part.Relations.Count)
 
             subStep = "part.InWorkObject"
             Try
@@ -909,7 +1102,7 @@ Public Class CatiaRunner
             End If
 
             subStep = "EnsureCoordinateLawsBound"
-            EnsureCoordinateLawsBound(part.Relations, GetCoordinateLawExpressions(fit))
+            EnsureCoordinateLawsBound(part.Relations, relCountBefore)
 
             subStep = "rename and update"
             equationCurve.Name = FormatSpiralCurveName(fit)
@@ -920,29 +1113,53 @@ Public Class CatiaRunner
         End Try
     End Function
 
-    Private Shared Function WaitForEquationCurve(ByVal doc As Object, ByVal part As Object, ByVal resultBody As Object, ByVal initialShapeCount As Integer, ByVal fit As FitResult, ByVal timeoutSeconds As Integer, ByVal cancellation As System.Threading.CancellationToken) As Object
-        Dim deadline As DateTime = DateTime.Now.AddSeconds(timeoutSeconds)
-        Dim lastError As String = "尚未发现可更新的新增曲线。"
-        Do While DateTime.Now < deadline
-            cancellation.ThrowIfCancellationRequested()
-            Dim equationCurve As Object = Nothing
+    Private Shared Function MeasureCurveStartDistanceToCenter(ByVal doc As Object, ByVal part As Object, ByVal tempBody As Object, ByVal curve As Object, ByVal center As Point3) As Double
+        Dim factory As Object = part.HybridShapeFactory
+        Dim curveRef As Object = part.CreateReferenceFromObject(curve)
+        Dim probePt As Object = factory.AddNewPointOnCurveFromPercent(curveRef, 0.0, False)
+        probePt.Name = "__ProbeStart"
+        tempBody.AppendHybridShape(probePt)
+        Try
+            part.Update()
+            Dim pr As Object = part.CreateReferenceFromObject(probePt)
+            Dim coordinates(2) As Object
+            doc.GetWorkbench("SPAWorkbench").GetMeasurable(pr).GetPoint(coordinates)
+            Dim dx As Double = CDbl(coordinates(0)) - center.X
+            Dim dy As Double = CDbl(coordinates(1)) - center.Y
+            Dim dz As Double = CDbl(coordinates(2)) - center.Z
+            Return Math.Sqrt(dx * dx + dy * dy + dz * dz)
+        Finally
             Try
-                Dim shapeCount As Integer = CInt(resultBody.HybridShapes.Count)
-                If shapeCount > initialShapeCount Then
-                    Dim candidate As Object = resultBody.HybridShapes.Item(shapeCount)
-                    If CBool(part.IsUpToDate(candidate)) Then equationCurve = candidate
-                End If
-            Catch ex As Exception
-                lastError = ex.Message
+                Dim sel As Object = doc.Selection
+                sel.Clear()
+                sel.Add(probePt)
+                sel.Delete()
+                sel.Clear()
+            Catch
             End Try
-            If equationCurve IsNot Nothing Then
-                equationCurve.Name = FormatSpiralCurveName(fit)
-                part.Update()
-                Return equationCurve
+        End Try
+    End Function
+
+    Private Shared Function VerifyEquationAndBaseCircleBinding(ByVal doc As Object, ByVal part As Object, ByVal tempBody As Object, ByVal equationCurve As Object, ByVal baseCircle As Object, ByVal pSpiralA As Object, ByVal fit As FitResult) As Double
+        Dim aMm As Double = Math.Exp(fit.Alpha)
+        Dim d0 As Double = MeasureCurveStartDistanceToCenter(doc, part, tempBody, equationCurve, fit.Center)
+        Dim gap0 As Double = Math.Abs(d0 - aMm)
+        Try
+            pSpiralA.ValuateFromString((aMm + 10.0).ToString("R", Inv) & "mm")
+            part.Update()
+            Dim rCircleAfter As Double = CDbl(baseCircle.Radius.Value)
+            Dim dAfter As Double = MeasureCurveStartDistanceToCenter(doc, part, tempBody, equationCurve, fit.Center)
+            If Math.Abs((rCircleAfter - aMm) - 10.0) > 0.01 Then
+                Throw New InvalidOperationException(String.Format(Inv, "基圆半径未随 LogSpiral_a (+10 mm) 联动更新（实际增量 {0:F4} mm）。", rCircleAfter - aMm))
             End If
-            System.Threading.Thread.Sleep(500)
-        Loop
-        Throw New TimeoutException("等待 CATIA 方程曲线超时。最后检测信息：" & lastError)
+            If Math.Abs((dAfter - d0) - 10.0) > 0.5 Then
+                Throw New InvalidOperationException(String.Format(Inv, "方程曲线内端未随 LogSpiral_a (+10 mm) 联动更新（实际增量 {0:F4} mm）。", dAfter - d0))
+            End If
+        Finally
+            pSpiralA.ValuateFromString(aMm.ToString("R", Inv) & "mm")
+            part.Update()
+        End Try
+        Return gap0
     End Function
 
     Private Shared Sub WriteReports(ByVal outputPath As String, ByVal fit As FitResult)
@@ -974,23 +1191,45 @@ Public Class CatiaRunner
         json.AppendLine("  ""turns"": " & (Math.Abs(fit.ThetaEnd - fit.ThetaStart) / (2.0 * Math.PI)).ToString("R", Inv) & ",")
         json.AppendLine("  ""rms_error_mm"": " & fit.RmsError.ToString("R", Inv) & ",")
         json.AppendLine("  ""max_error_mm"": " & fit.MaxError.ToString("R", Inv) & ",")
+        json.AppendLine("  ""in_plane_radial_rms_mm"": " & fit.RadialRmsError.ToString("R", Inv) & ",")
+        json.AppendLine("  ""in_plane_radial_max_mm"": " & fit.RadialMaxError.ToString("R", Inv) & ",")
+        json.AppendLine("  ""planarity_rms_mm"": " & fit.PlanarityRms.ToString("R", Inv) & ",")
         json.AppendLine("  ""planarity_max_mm"": " & fit.PlanarityMax.ToString("R", Inv) & ",")
+        If Not Double.IsNaN(fit.InnerGapMm) Then
+            json.AppendLine("  ""inner_endpoint_to_base_circle_gap_mm"": " & fit.InnerGapMm.ToString("R", Inv) & ",")
+        End If
         json.AppendLine("  ""r2_logpolar"": " & fit.R2.ToString("R", Inv))
         json.AppendLine("}")
         WriteHiddenProcessFile(basePath & "_report.json", json.ToString())
 
-        Dim csv As New StringBuilder("index,source_x_mm,source_y_mm,source_z_mm,theta_rad,normal_residual_mm" & Environment.NewLine)
+        Dim csv As New StringBuilder("index,source_x_mm,source_y_mm,source_z_mm,theta_rad,in_plane_normal_residual_mm,in_plane_radial_residual_mm" & Environment.NewLine)
         For i As Integer = 0 To fit.SourcePoints.Length - 1
             Dim p As Point3 = fit.SourcePoints(i)
-            csv.AppendLine(String.Format(Inv, "{0},{1:R},{2:R},{3:R},{4:R},{5:R}", i, p.X, p.Y, p.Z, fit.Theta(i), fit.Residual(i)))
+            csv.AppendLine(String.Format(Inv, "{0},{1:R},{2:R},{3:R},{4:R},{5:R},{6:R}", i, p.X, p.Y, p.Z, fit.Theta(i), fit.Residual(i), fit.RadialResidual(i)))
         Next
         WriteHiddenProcessFile(basePath & "_samples.csv", csv.ToString())
     End Sub
 
+    Private Shared Sub DeleteFileQuietly(ByVal filePath As String)
+        If String.IsNullOrEmpty(filePath) OrElse Not File.Exists(filePath) Then Return
+        Try
+            File.SetAttributes(filePath, FileAttributes.Normal)
+            File.Delete(filePath)
+        Catch
+        End Try
+    End Sub
+
     Public Shared Function Run(ByVal spacingMm As Double, ByVal choice As CurveChoice, Optional ByVal progress As Action(Of Integer, String) = Nothing, Optional ByVal cancellation As System.Threading.CancellationToken = Nothing, Optional ByVal reportReady As Action(Of String) = Nothing) As String
         If choice Is Nothing Then Throw New InvalidOperationException("请先选择需要拟合的曲线。")
+        cancellation.ThrowIfCancellationRequested()
+
+        Dim templatePath As String = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LogSpiral_PowerCopy.CATPart")
+        If Not File.Exists(templatePath) Then
+            Throw New FileNotFoundException("未找到模板文件 LogSpiral_PowerCopy.CATPart，无法全自动生成原生方程曲线。请确保该文件与 LogSpiralFitter.exe 位于同一目录。", templatePath)
+        End If
+
         Dim sampleCount As Integer = ComputeSampleCount(choice.LengthMm, spacingMm)
-        If progress IsNot Nothing Then progress(5, "[步骤 1/6] 正在复制源 CATPart 并打开工作文档…")
+        If progress IsNot Nothing Then progress(5, "[步骤 1/6] 正在校验源文档并创建临时工作副本…")
         Dim catia As Object = Marshal.GetActiveObject("CATIA.Application")
         Dim sourceDoc As Object = Nothing
         For i As Integer = 1 To catia.Documents.Count
@@ -1004,13 +1243,19 @@ Public Class CatiaRunner
             End Try
         Next
         If sourceDoc Is Nothing Then Throw New InvalidOperationException("选择曲线所在的 CATPart 已关闭，请重新选择。")
+        Try
+            If Not CBool(sourceDoc.Saved) Then
+                Throw New InvalidOperationException("源 CATPart 存在未保存的修改，请先在 CATIA 中保存后再运行拟合。")
+            End If
+        Catch ex As InvalidOperationException
+            Throw
+        Catch
+        End Try
         sourceDoc.Activate()
         Dim sourcePath As String = choice.DocumentPath
         If String.IsNullOrWhiteSpace(sourcePath) OrElse Not File.Exists(sourcePath) Then
             Throw New InvalidOperationException("选择的 CATPart 尚未保存。")
         End If
-        Dim bodyIndex As Integer = choice.BodyIndex
-        Dim shapeIndex As Integer = choice.ShapeIndex
 
         Dim directory As String = Path.GetDirectoryName(sourcePath)
         Dim stem As String = Path.GetFileNameWithoutExtension(sourcePath)
@@ -1018,18 +1263,28 @@ Public Class CatiaRunner
         If File.Exists(outputPath) Then
             outputPath = Path.Combine(directory, stem & "_LogSpiralEquation_" & DateTime.Now.ToString("yyyyMMdd_HHmmss", Inv) & ".CATPart")
         End If
-        File.Copy(sourcePath, outputPath, False)
-        Dim outputDoc As Object = catia.Documents.Open(outputPath)
-        Dim outputPart As Object = outputDoc.Part
-        Dim curve As Object = outputPart.HybridBodies.Item(bodyIndex).HybridShapes.Item(shapeIndex)
+        Dim outputStem As String = Path.GetFileNameWithoutExtension(outputPath)
+        Dim reportJsonPath As String = Path.Combine(directory, outputStem & "_report.json")
+        Dim samplesCsvPath As String = Path.Combine(directory, outputStem & "_samples.csv")
+        Dim tempWorkPath As String = Path.Combine(directory, ".__tmp_" & stem & "_" & Guid.NewGuid().ToString("N") & ".CATPart")
+
+        Dim outputDoc As Object = Nothing
         Dim tempBody As Object = Nothing
-        Dim stage As String = "sampling"
+        Dim stage As String = "copying and verifying source curve"
         Try
+            cancellation.ThrowIfCancellationRequested()
+            File.Copy(sourcePath, tempWorkPath, True)
+            outputDoc = catia.Documents.Open(tempWorkPath)
+            Dim outputPart As Object = outputDoc.Part
+            Dim curve As Object = ResolveCurveInCopiedPart(outputDoc, outputPart, choice)
+
+            stage = "sampling"
             cancellation.ThrowIfCancellationRequested()
             If progress IsNot Nothing Then
                 progress(10, String.Format(Inv, "[步骤 2/6] 曲线长 {0:F2} mm，按 {1:F2} mm 间距自适应采样 {2} 点…", choice.LengthMm, spacingMm, sampleCount))
             End If
             Dim samples() As Point3 = SampleCurve(outputDoc, outputPart, curve, sampleCount, spacingMm, tempBody, progress, cancellation)
+
             cancellation.ThrowIfCancellationRequested()
             stage = "numerical fitting"
             If progress IsNot Nothing Then progress(55, "[步骤 3/6] 正在拟合平面、中心与对数螺旋线参数 (共 " & sampleCount.ToString(Inv) & " 点)…")
@@ -1038,34 +1293,27 @@ Public Class CatiaRunner
             fit.SampleCount = sampleCount
             cancellation.ThrowIfCancellationRequested()
             If reportReady IsNot Nothing Then reportReady(FormatParameterReport(fit, Double.NaN))
+
             stage = "building equation laws"
-            Dim templatePath As String = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LogSpiral_PowerCopy.CATPart")
-            Dim usePowerCopy As Boolean = File.Exists(templatePath)
             If progress IsNot Nothing Then
-                progress(70, "[步骤 4/6] 正在创建参考几何、基圆与标准方程命名参数…")
+                progress(70, "[步骤 4/6] 正在创建参数化参考几何、基圆与命名参数…")
             End If
             Dim paramMap As Dictionary(Of String, Object) = Nothing
-            Dim equationData() As Object = BuildEquationDefinition(outputDoc, outputPart, fit, Not usePowerCopy, paramMap)
+            Dim equationData() As Object = BuildEquationDefinition(outputDoc, outputPart, fit, paramMap)
             Dim resultBody As Object = equationData(0)
-            Dim baseCircle As Object = equationData(4)
-            Dim auxShapes() As Object = DirectCast(equationData(5), Object())
-            Dim equationCurve As Object
-            If usePowerCopy Then
-                stage = "instantiating PowerCopy equation curve"
-                If progress IsNot Nothing Then progress(82, "[步骤 5/6] 正在生成原生 GSMCurveEquations 对数螺旋线…")
-                equationCurve = InstantiateEquationCurveFromPowerCopy(outputDoc, outputPart, resultBody, paramMap, fit, templatePath)
-            Else
-                stage = "opening CATIA Curve from Equations command"
-                catia.ActiveWindow.ActiveViewer.Reframe()
-                Dim selection As Object = outputDoc.Selection
-                selection.Clear()
-                selection.Add(equationData(1))
-                Dim initialShapeCount As Integer = CInt(resultBody.HybridShapes.Count)
-                catia.StartCommand("CATShapeDesignCurveEquations")
-                stage = "waiting for the native equation curve"
-                If progress IsNot Nothing Then progress(82, "[步骤 5/6] 请在 CATIA 方程曲线窗口中选择 X/Y/Z 三条法则，然后点[确定]…")
-                equationCurve = WaitForEquationCurve(outputDoc, outputPart, resultBody, initialShapeCount, fit, 900, cancellation)
-            End If
+            Dim pSpiralA As Object = equationData(1)
+            Dim baseCircle As Object = equationData(2)
+            Dim auxShapes() As Object = DirectCast(equationData(3), Object())
+
+            stage = "instantiating equation curve"
+            If progress IsNot Nothing Then progress(80, "[步骤 5/6] 正在生成并绑定原生 GSMCurveEquations 对数螺旋线…")
+            Dim equationCurve As Object = InstantiateEquationCurveFromTemplate(outputDoc, outputPart, resultBody, fit, templatePath)
+
+            stage = "verifying parameter binding"
+            If progress IsNot Nothing Then progress(88, "[步骤 5/6] 正在校验参数联动与内端基圆距离…")
+            fit.InnerGapMm = VerifyEquationAndBaseCircleBinding(outputDoc, outputPart, tempBody, equationCurve, baseCircle, pSpiralA, fit)
+            If reportReady IsNot Nothing Then reportReady(FormatParameterReport(fit, Double.NaN))
+
             stage = "finalizing visibility and saving"
             If progress IsNot Nothing Then progress(94, "[步骤 6/6] 正在设置螺旋线参数化名称、隐藏过程几何与过程文件并保存…")
             equationCurve.Name = FormatSpiralCurveName(fit)
@@ -1075,18 +1323,35 @@ Public Class CatiaRunner
             SetObjectsVisibility(outputDoc, hideList, False)
             SetObjectsVisibility(outputDoc, New Object() {resultBody, baseCircle, equationCurve}, True)
             outputPart.Update()
+            Dim nativeCurveLength As Double = MeasureCurveLength(outputDoc, outputPart, equationCurve)
             outputDoc.Save()
+
             stage = "writing reports"
             WriteReports(outputPath, fit)
-            Dim nativeCurveLength As Double = MeasureCurveLength(outputDoc, outputPart, equationCurve)
+
+            outputDoc.Close()
+            outputDoc = Nothing
+            File.Move(tempWorkPath, outputPath)
+            Try : catia.Documents.Open(outputPath) : Catch : End Try
+
             If progress IsNot Nothing Then progress(100, "[完成] 对数螺旋线与基圆已生成并保存。")
             Return outputPath & Environment.NewLine &
                 FormatParameterReport(fit, nativeCurveLength)
         Catch ex As OperationCanceledException
-            Try : DeleteTemporaryBody(outputDoc, tempBody) : Catch : End Try
+            If outputDoc IsNot Nothing Then
+                Try : outputDoc.Close() : Catch : End Try
+            End If
+            DeleteFileQuietly(tempWorkPath)
+            DeleteFileQuietly(reportJsonPath)
+            DeleteFileQuietly(samplesCsvPath)
             Throw
         Catch ex As Exception
-            Try : DeleteTemporaryBody(outputDoc, tempBody) : Catch : End Try
+            If outputDoc IsNot Nothing Then
+                Try : outputDoc.Close() : Catch : End Try
+            End If
+            DeleteFileQuietly(tempWorkPath)
+            DeleteFileQuietly(reportJsonPath)
+            DeleteFileQuietly(samplesCsvPath)
             Throw New InvalidOperationException("Stage '" & stage & "' failed: " & ex.Message, ex)
         End Try
     End Function
@@ -1105,7 +1370,12 @@ Public Class CatiaRunner
         report.AppendLine(String.Format(Inv, "扩展角 α = atan(b) = {0:F9}°（切线与圆周方向的有符号夹角）", Math.Atan(fit.B) * 180.0 / Math.PI))
         report.AppendLine(String.Format(Inv, "起始角 = {0:F9}°    终止角 = {1:F9}°", fit.ThetaStart * 180.0 / Math.PI, fit.ThetaEnd * 180.0 / Math.PI))
         report.AppendLine(String.Format(Inv, "展开角（覆盖角）= {0:F9}°    圈数 = {1:F9}", Math.Abs(fit.ThetaEnd - fit.ThetaStart) * 180.0 / Math.PI, Math.Abs(fit.ThetaEnd - fit.ThetaStart) / (2.0 * Math.PI)))
-        report.AppendLine(String.Format(Inv, "RMS = {0:F6} mm    最大误差 = {1:F6} mm    R² = {2:F9}", fit.RmsError, fit.MaxError, fit.R2))
+        report.AppendLine(String.Format(Inv, "平面内法向残差 RMS = {0:F6} mm    最大 = {1:F6} mm    R² = {2:F9}", fit.RmsError, fit.MaxError, fit.R2))
+        report.AppendLine(String.Format(Inv, "平面内径向残差 RMS = {0:F6} mm    最大 = {1:F6} mm", fit.RadialRmsError, fit.RadialMaxError))
+        report.AppendLine(String.Format(Inv, "离平面偏差 RMS = {0:F6} mm    最大 = {1:F6} mm", fit.PlanarityRms, fit.PlanarityMax))
+        If Not Double.IsNaN(fit.InnerGapMm) Then
+            report.AppendLine(String.Format(Inv, "内端落于基圆实测间隙 = {0:F6} mm", fit.InnerGapMm))
+        End If
         Dim theoreticalLength As Double
         If Math.Abs(fit.B) < 0.000000000001 Then
             theoreticalLength = aMm * Math.Abs(fit.ThetaEnd - fit.ThetaStart)
@@ -1114,7 +1384,12 @@ Public Class CatiaRunner
         End If
         report.AppendLine(String.Format(Inv, "理论解析弧长 = {0:F9} mm", theoreticalLength))
         report.AppendLine(If(Double.IsNaN(nativeCurveLength), "CATIA 实测弧长：待测或接口不支持；不影响参数报告。", String.Format(Inv, "CATIA 实测弧长 = {0:F9} mm", nativeCurveLength)))
-        report.AppendLine("a 对应参考 U 轴零角方向；b 和角度符号随 U/V 方向约定。")
+        If fit.Warnings IsNot Nothing AndAlso fit.Warnings.Count > 0 Then
+            For Each w As String In fit.Warnings
+                report.AppendLine(w)
+            Next
+        End If
+        report.AppendLine("a 对应参考 U 轴零角方向（内端起点）；b 和角度符号随 U/V 方向约定。")
         Return report.ToString()
     End Function
 End Class

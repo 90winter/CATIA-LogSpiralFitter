@@ -34,7 +34,7 @@
 3. **二维中心稳健非线性优化（`EvaluateCenter` + `NelderMead`）**：
    - 给定平面候选中心 $(c_x, c_y)$，计算极径 $r_i = \hypot(x_i - c_x, y_i - c_y)$ 与解缠绕连续极角 $\theta_i = \operatorname{Unwrap}(\operatorname{atan2}(y_i - c_y, x_i - c_x))$。
    - 对 $\ln r_i = \alpha + b\theta_i$ 做闭式最小二乘线性回归，得到解析最优 $(\alpha, b)$，再计算径向残差 $e_i = \hat{r}(\theta_i) - r_i$。
-   - 目标函数采用伪 Huber 稳健损失 + 轻微中心偏移正则项，从质心、包围盒中心、三点代数圆心（`CircleCenter`）及 $3 \times 3$ 网格共 12 个初值启动两阶段 Nelder-Mead 单纯形搜索，精化得到全局最优中心 $(c_x^*, c_y^*)$。
+   - 目标函数采用伪 Huber 稳健损失 + 轻微中心偏移正则项，从质心、包围盒中心、三点代数圆心（`CircleCenter`）及 $3 \times 3$ 网格共 12 个初值启动两阶段 Nelder-Mead 单纯形搜索，精化得到多起点搜索找到的最优候选中心 $(c_x^*, c_y^*)$。
 
 4. **内端零度基准轴对齐与基圆定义（Scheme 1）**：
    - 初始正交基 $(\mathbf{e}_{U0}, \mathbf{e}_{V0})$ 仅用于平面投影与优化，其零角方向任意。
@@ -43,7 +43,9 @@
      $$\mathbf{e}_U = \cos\theta_{\text{inner}}\,\mathbf{e}_{U0} + \sin\theta_{\text{inner}}\,\mathbf{e}_{V0}, \quad \mathbf{e}_V = -\sin\theta_{\text{inner}}\,\mathbf{e}_{U0} + \cos\theta_{\text{inner}}\,\mathbf{e}_{V0}$$
    - 令新极角 $\theta' = \theta - \theta_{\text{inner}}$，则内端起点处 $\theta'_{\text{start}} = 0$，外端为 $\theta'_{\text{end}} = \theta_{\text{outer}} - \theta_{\text{inner}}$，重参数化后的对数截距为：
      $$\alpha' = \alpha + b\theta_{\text{inner}}, \quad a = e^{\alpha'} = r_{\min}$$
-   - **几何意义**：三维螺旋线空间轨迹完全不变（对任意参数 $t \in [0, 1]$，空间点 $\mathbf{C} + r(\theta'(t))(\cos\theta'(t)\,\mathbf{e}_U + \sin\theta'(t)\,\mathbf{e}_V)$ 恒等），而参数 $a = r(0)$ 直接等于螺旋线最内端起点半径（基圆半径），基圆（`AddNewCircleCtrRad`）正好内切于螺旋线内端起点。
+   - **几何意义**：三维螺旋线空间轨迹完全不变（对任意参数 $t \in [0, 1]$，空间点 $\mathbf{C} + r(\theta'(t))(\cos\theta'(t)\,\mathbf{e}_U + \sin\theta'(t)\,\mathbf{e}_V)$ 恒等），而参数 $a = r(0)$ 直接等于螺旋线最内端起点半径（基圆半径），使螺旋线内端落在基圆上（当 $b \neq 0$ 时内端切向含径向分量 $ab$，与基圆相交而不共切）。
+   - **参数化联动与自检**：`Fitted_Center`、`Fitted_Plane`、`baseCircle.Radius` 及 `Base_Circle_Radius/Diameter` 均通过 `CreateOrUpdateFormula` 绑定到根参数；`EnsureCoordinateLawsBound` 自动识别粘贴后 Law 的本地化形式参数名（如 `长度.2` / `实数.1` 与 `FormalLength.1` / `FormalReal.1`）并用 `Law.Modify` 绑定到当前零件根参数；输出前通过 `VerifyEquationAndBaseCircleBinding` 临时把 `LogSpiral_a` 增加 `10 mm` 验证曲线内端与基圆同步移动，并记录内端到基圆实测间隙。
+   - **安全与原子性**：选线与运行前均校验 `doc.Saved`，并在副本中按 `BodyName` + `CurveName` + 实测弧长校验曲线一致性；缺失 `LogSpiral_PowerCopy.CATPart` 直接报错；工作在临时 `.CATPart` 中完成，取消或失败时自动关闭并清理全部临时产物与报告，仅在全部成功后再重命名为正式 `*_LogSpiralEquation.CATPart` 并恢复原 `DisplayFileAlerts` 设置。
 
 ---
 
