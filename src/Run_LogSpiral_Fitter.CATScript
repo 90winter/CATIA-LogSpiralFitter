@@ -1,0 +1,13 @@
+Language="VBSCRIPT"
+
+Sub CATMain()
+    Dim shell, fso, toolPath, commandLine
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    toolPath = "C:\对数螺旋线\LogSpiralFitter.exe"
+    If Not fso.FileExists(toolPath) Then
+        toolPath = "C:\对数螺旋线\src\LogSpiralFitter.exe"
+    End If
+    Set shell = CreateObject("WScript.Shell")
+    commandLine = Chr(34) & toolPath & Chr(34)
+    shell.Run commandLine, 1, False
+End Sub
